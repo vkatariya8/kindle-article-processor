@@ -427,6 +427,13 @@ def main():
         print(f"Created: {output_file}")
         print(f"Size: {output_file.stat().st_size / 1024:.1f} KB")
 
+    # Mark articles as sent to kindle BEFORE sending
+    # This prevents re-selection if sending fails
+    print("\nMarking articles as sent-to-kindle...")
+    for article in articles:
+        mark_sent_to_kindle(article)
+    print(f"Updated {len(articles)} article(s).")
+
     # Send to Kindle
     print("\nSending to Kindle...")
     book_title = f"Articles Bundle - {today}"
@@ -435,12 +442,6 @@ def main():
     else:
         print("Failed to send to Kindle.")
         sys.exit(1)
-
-    # Mark articles as sent to kindle
-    print("\nMarking articles as sent-to-kindle...")
-    for article in articles:
-        mark_sent_to_kindle(article)
-    print(f"Updated {len(articles)} article(s).")
 
 
 if __name__ == "__main__":
