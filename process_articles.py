@@ -7,6 +7,8 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+import count_images
+
 INBOX_DIR = Path(__file__).parent / "Inbox"
 ARCHIVE_DIR = Path(__file__).parent / "Archive"
 
@@ -175,6 +177,9 @@ def main():
     """Main entry point."""
     print("Article Processor")
     print("-" * 40)
+
+    print("\nUpdating image counts...")
+    count_images.update_image_counts()
 
     articles = get_kindle_articles()
 

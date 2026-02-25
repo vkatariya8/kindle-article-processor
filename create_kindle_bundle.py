@@ -11,6 +11,8 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+import count_images
+
 INBOX_DIR = Path(__file__).parent / "Inbox"
 OUTPUT_DIR = Path(__file__).parent
 
@@ -71,9 +73,13 @@ def get_candidate_articles(filter_sent: bool = True) -> list[tuple[Path, dict]]:
         if filter_sent and metadata.get('sent-to-kindle') == 'yes':
             continue
 
+        # Get image count for display
+        image_count = int(metadata.get('image_count', 0))
+
         article_metadata = {
             'title': metadata.get('title', article.stem),
             'word_count': len(body.split()),
+            'image_count': image_count,
             'date': metadata.get('created') or metadata.get('published') or
                     datetime.fromtimestamp(article.stat().st_mtime).strftime("%Y-%m-%d"),
             'mtime': article.stat().st_mtime
@@ -104,12 +110,12 @@ def display_article_selection_ui(candidates: list[tuple[Path, dict]], target_wor
 
     # Display available articles with numbering
     print(f"Available articles ({len(candidates)} total):\n")
-    print(f"{'#':<4} {'Words':>8}  {'Date':<12}  {'Title':<50}")
-    print("-" * 80)
+    print(f"{'#':<4} {'Words':>8} {'Images':>7}  {'Date':<12}  {'Title':<45}")
+    print("-" * 85)
 
     for idx, (filepath, meta) in enumerate(candidates, 1):
-        title = meta['title'][:47] + "..." if len(meta['title']) > 50 else meta['title']
-        print(f"{idx:<4} {meta['word_count']:>8,}  {meta['date']:<12}  {title}")
+        title = meta['title'][:42] + "..." if len(meta['title']) > 45 else meta['title']
+        print(f"{idx:<4} {meta['word_count']:>8,} {meta['image_count']:>7}  {meta['date']:<12}  {title}")
 
     # Interactive selection loop
     selected = []
@@ -426,11 +432,16 @@ def main():
                         help='Select oldest articles first (for auto mode)')
     args = parser.parse_args()
 
-    # Step 1: Set fixed target word count
+    # Step 1: Update image counts
+    print("Updating image counts...")
+    stats = count_images.update_image_counts()
+    print(f"Processed {stats['total']} article(s), updated {stats['updated']}\n")
+
+    # Step 2: Set fixed target word count
     TARGET_WORDS = 20000
     print(f"Target word count: {TARGET_WORDS:,} words\n")
 
-    # Step 2: Get candidate articles (unsent only)
+    # Step 3: Get candidate articles (unsent only, filtered by image count)
     candidates = get_candidate_articles(filter_sent=True)
 
     if not candidates:
