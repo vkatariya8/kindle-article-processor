@@ -4,6 +4,7 @@
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -195,19 +196,37 @@ def display_article_selection_ui(candidates: list[tuple[Path, dict]], target_wor
     return selected
 
 
-def automatic_selection(candidates: list[tuple[Path, dict]], target_words: int, select_newest: bool = False) -> list[Path]:
+def automatic_selection(candidates: list[tuple[Path, dict]], target_words: int, select_newest: bool = False, count: int | None = None) -> list[Path]:
     """Automatically select articles until reaching target word count.
 
     Args:
         candidates: List of (filepath, metadata) tuples sorted by age
         target_words: Target total word count
         select_newest: If True, select newest articles; otherwise oldest
+        count: If set, select exactly this many articles (ignores word count)
 
     Returns:
         List of selected article paths
     """
     selected = []
     total_words = 0
+    
+    # If count is specified, select exactly that many articles
+    if count is not None:
+        order = "newest" if select_newest else "oldest"
+        print(f"Selecting {count} {order} articles...\n")
+        
+        for i, (filepath, meta) in enumerate(candidates):
+            if i >= count:
+                break
+            selected.append(filepath)
+            total_words += meta['word_count']
+            print(f"  Added: {meta['title'][:60]} ({meta['word_count']:,} words)")
+        
+        print(f"\nSelected: {len(selected)} articles, {total_words:,} words")
+        return selected
+
+    # Original word-count-based selection
     target_max = int(target_words * 1.1)  # Don't exceed 110% of target
 
     order = "newest" if select_newest else "oldest"
@@ -273,6 +292,76 @@ def mark_sent_to_kindle(filepath: Path) -> None:
     filepath.write_text(updated, encoding="utf-8")
 
 
+def convert_webp_images(epub_path: Path) -> Path:
+    """Convert WebP images to JPEG in the EPUB for Kindle compatibility.
+    
+    Kindle doesn't support WebP images in EPUBs, so we need to convert them.
+    """
+    import zipfile
+    import tempfile
+    
+    temp_epub = epub_path.with_suffix('.tmp.epub')
+    
+    # First pass: convert WebP images to JPEG
+    webp_conversions = {}  # old filename -> new filename
+    
+    with zipfile.ZipFile(epub_path, 'r') as epub_zip:
+        with zipfile.ZipFile(temp_epub, 'w', zipfile.ZIP_DEFLATED) as new_zip:
+            for item in epub_zip.infolist():
+                data = epub_zip.read(item.filename)
+                
+                # Check if this is a WebP image
+                if item.filename.lower().endswith('.webp'):
+                    tmp_webp = Path(tempfile.mktemp(suffix='.webp'))
+                    tmp_webp.write_bytes(data)
+                    
+                    jpg_path = None
+                    try:
+                        # Convert using sips (macOS built-in)
+                        jpg_path = tmp_webp.with_suffix('.jpg')
+                        result = subprocess.run(
+                            ['sips', '-s', 'format', 'jpeg', str(tmp_webp), '--out', str(jpg_path)],
+                            capture_output=True
+                        )
+                        
+                        if result.returncode == 0 and jpg_path.exists():
+                            new_filename = item.filename[:-5] + '.jpg'  # Replace .webp with .jpg
+                            new_zip.writestr(new_filename, jpg_path.read_bytes())
+                            webp_conversions[item.filename] = new_filename
+                            print(f"  Converted: {item.filename} -> {new_filename}")
+                        else:
+                            new_zip.writestr(item, data)
+                            print(f"  Warning: Could not convert {item.filename}")
+                    finally:
+                        if tmp_webp.exists():
+                            tmp_webp.unlink()
+                        if jpg_path and jpg_path.exists():
+                            jpg_path.unlink()
+                else:
+                    new_zip.writestr(item, data)
+    
+    temp_epub.replace(epub_path)
+    
+    # Second pass: update HTML references from .webp to .jpg
+    temp_epub2 = epub_path.with_suffix('.tmp2.epub')
+    
+    with zipfile.ZipFile(epub_path, 'r') as epub_zip:
+        with zipfile.ZipFile(temp_epub2, 'w', zipfile.ZIP_DEFLATED) as new_zip:
+            for item in epub_zip.infolist():
+                data = epub_zip.read(item.filename)
+                
+                # Update HTML/XHTML files to reference .jpg instead of .webp
+                if item.filename.endswith(('.html', '.xhtml')):
+                    data = data.replace(b'.webp', b'.jpg')
+                
+                new_zip.writestr(item, data)
+    
+    temp_epub2.replace(epub_path)
+    
+    print("Converted WebP images to JPEG for Kindle compatibility.")
+    return epub_path
+
+
 def send_to_kindle(epub_path: Path, title: str) -> bool:
     """Send the epub to Kindle via calibre-smtp."""
     password = os.environ.get("GMAIL_APP_PASSWORD")
@@ -331,6 +420,10 @@ def main():
     parser = argparse.ArgumentParser(description="Bundle articles into epub for Kindle")
     parser.add_argument('--auto', action='store_true',
                         help='Automatically select oldest articles to reach target word count')
+    parser.add_argument('--count', type=int, default=None,
+                        help='Number of oldest articles to select')
+    parser.add_argument('--oldest', action='store_true',
+                        help='Select oldest articles first (for auto mode)')
     args = parser.parse_args()
 
     # Step 1: Set fixed target word count
@@ -365,16 +458,19 @@ def main():
 
     # Step 4: Ask for oldest/newest when in automatic mode
     if use_auto:
-        while True:
-            response = input("Select (o=oldest articles first, n=newest articles first): ").strip().lower()
-            if response in ['o', 'oldest', 'old', '']:
-                select_newest = False
-                break
-            elif response in ['n', 'newest', 'new']:
-                select_newest = True
-                break
-            else:
-                print("Please enter 'o' for oldest or 'n' for newest.")
+        if args.oldest or args.count:
+            select_newest = False
+        else:
+            while True:
+                response = input("Select (o=oldest articles first, n=newest articles first): ").strip().lower()
+                if response in ['o', 'oldest', 'old', '']:
+                    select_newest = False
+                    break
+                elif response in ['n', 'newest', 'new']:
+                    select_newest = True
+                    break
+                else:
+                    print("Please enter 'o' for oldest or 'n' for newest.")
 
     # Step 5: Select articles (automatic or interactive)
     if use_auto:
@@ -382,13 +478,13 @@ def main():
         if select_newest:
             # Reverse candidates to get newest first
             candidates = list(reversed(candidates))
-        articles = automatic_selection(candidates, TARGET_WORDS, select_newest)
+        articles = automatic_selection(candidates, TARGET_WORDS, select_newest, args.count)
     else:
         articles = display_article_selection_ui(candidates, TARGET_WORDS)
 
     # Step 4: Continue with existing epub creation logic
     today = datetime.now().strftime("%Y-%m-%d")
-    output_file = OUTPUT_DIR / f"articles-{today}.epub"
+    epub_file = OUTPUT_DIR / f"articles-{today}.epub"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -410,7 +506,7 @@ def main():
             "pandoc",
             str(metadata_file),
             *[str(f) for f in prepared_files],
-            "-o", str(output_file),
+            "-o", str(epub_file),
             "--toc",
             "--toc-depth=1",
             "--epub-chapter-level=1",
@@ -424,8 +520,13 @@ def main():
             print(f"Error: {result.stderr}")
             return
 
-        print(f"Created: {output_file}")
-        print(f"Size: {output_file.stat().st_size / 1024:.1f} KB")
+        print(f"Created: {epub_file}")
+        print(f"Size: {epub_file.stat().st_size / 1024:.1f} KB")
+
+        # Convert WebP images to JPEG for Kindle compatibility
+        print("\nConverting WebP images to JPEG...")
+        convert_webp_images(epub_file)
+        print(f"Size after conversion: {epub_file.stat().st_size / 1024:.1f} KB")
 
     # Mark articles as sent to kindle BEFORE sending
     # This prevents re-selection if sending fails
@@ -437,7 +538,7 @@ def main():
     # Send to Kindle
     print("\nSending to Kindle...")
     book_title = f"Articles Bundle - {today}"
-    if send_to_kindle(output_file, book_title):
+    if send_to_kindle(epub_file, book_title):
         print("Sent successfully!")
     else:
         print("Failed to send to Kindle.")
