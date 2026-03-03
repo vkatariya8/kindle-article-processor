@@ -41,7 +41,7 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
     for line in frontmatter_str.split('\n'):
         if ':' in line and not line.startswith(' '):
             key, _, value = line.partition(':')
-            key = key.strip()
+            key = key.strip().strip('"')
             value = value.strip().strip('"')
             if value:
                 metadata[key] = value
@@ -290,8 +290,8 @@ def mark_sent_to_kindle(filepath: Path) -> None:
     """Update the sent-to-kindle property to yes in the article's frontmatter."""
     content = filepath.read_text(encoding="utf-8")
     updated = re.sub(
-        r'^(sent-to-kindle:)\s*.*$',
-        r'\1 yes',
+        r'^"?sent-to-kindle"?:?\s*.*$',
+        r'sent-to-kindle: yes',
         content,
         flags=re.MULTILINE
     )
