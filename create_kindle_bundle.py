@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 import count_images
+import frontmatter_utils
 
 INBOX_DIR = Path(__file__).parent / "Inbox"
 OUTPUT_DIR = Path(__file__).parent
@@ -436,6 +437,10 @@ def main():
     print("Updating image counts...")
     stats = count_images.update_image_counts()
     print(f"Processed {stats['total']} article(s), updated {stats['updated']}\n")
+
+    # Step 1.5: Normalize frontmatter
+    print("Normalizing frontmatter...")
+    frontmatter_utils.normalize_inbox_articles()
 
     # Step 2: Set fixed target word count
     TARGET_WORDS = 20000

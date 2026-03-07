@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 import count_images
+import frontmatter_utils
 
 INBOX_DIR = Path(__file__).parent / "Inbox"
 ARCHIVE_DIR = Path(__file__).parent / "Archive"
@@ -44,7 +45,7 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
         # Check for key: value
         if ':' in line:
             key, _, value = line.partition(':')
-            key = key.strip()
+            key = key.strip().strip('"')
             value = value.strip().strip('"')
 
             if value:
@@ -146,6 +147,11 @@ def process_article(filepath: Path) -> None:
     # Step 4: Archive?
     archive = input("[4/4] Archive this article? (y/n, Enter for no): ").strip().lower()
     if archive == "y":
+        # Remove any existing read-status variants to avoid duplication
+        keys_to_remove = [k for k in frontmatter.keys() if k in ("read-status", "read_status", '"read-status"')]
+        for key in keys_to_remove:
+            del frontmatter[key]
+        
         frontmatter["read-status"] = "read"
         frontmatter["date-read"] = datetime.now().strftime("%Y-%m-%d")
 
@@ -180,6 +186,9 @@ def main():
 
     print("\nUpdating image counts...")
     count_images.update_image_counts()
+
+    print("\nNormalizing frontmatter...")
+    frontmatter_utils.normalize_inbox_articles()
 
     articles = get_kindle_articles()
 
