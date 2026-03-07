@@ -19,9 +19,9 @@ OUTPUT_DIR = Path(__file__).parent
 
 
 def get_oldest_articles(count: int = 10) -> list[Path]:
-    """Get the oldest N articles from Inbox, sorted by modification time."""
+    """Get the oldest N articles from Inbox, sorted by creation time."""
     articles = list(INBOX_DIR.glob("*.md"))
-    articles.sort(key=lambda p: p.stat().st_mtime)
+    articles.sort(key=lambda p: p.stat().st_ctime)
     return articles[:count]
 
 
@@ -61,7 +61,7 @@ def get_candidate_articles(filter_sent: bool = True) -> list[tuple[Path, dict]]:
     """Get candidate articles with metadata, sorted oldest first.
 
     Returns list of tuples: (filepath, metadata_dict)
-    metadata_dict contains: title, word_count, date, mtime
+    metadata_dict contains: title, word_count, date, ctime
     """
     articles = list(INBOX_DIR.glob("*.md"))
 
@@ -83,12 +83,12 @@ def get_candidate_articles(filter_sent: bool = True) -> list[tuple[Path, dict]]:
             'image_count': image_count,
             'date': metadata.get('created') or metadata.get('published') or
                     datetime.fromtimestamp(article.stat().st_mtime).strftime("%Y-%m-%d"),
-            'mtime': article.stat().st_mtime
+            'ctime': article.stat().st_ctime
         }
         candidates.append((article, article_metadata))
 
-    # Sort by modification time (oldest first)
-    candidates.sort(key=lambda x: x[1]['mtime'])
+    # Sort by creation time (oldest first)
+    candidates.sort(key=lambda x: x[1]['ctime'])
     return candidates
 
 
@@ -543,6 +543,19 @@ def main():
         print("\nConverting WebP images to JPEG...")
         convert_webp_images(epub_file)
         print(f"Size after conversion: {epub_file.stat().st_size / 1024:.1f} KB")
+
+    # Check file size against Gmail's 15MB attachment limit
+    GMAIL_SIZE_LIMIT = 15 * 1024 * 1024  # 15 MB in bytes
+    file_size = epub_file.stat().st_size
+
+    if file_size > GMAIL_SIZE_LIMIT:
+        size_mb = file_size / (1024 * 1024)
+        print(f"\nError: EPUB file is {size_mb:.1f}MB, which exceeds Gmail's 15MB attachment limit.")
+        print("Please make one of the following changes and re-run:")
+        print("  - Remove some articles from the selection")
+        print("  - Lower the target word count")
+        print("  - Select articles with fewer images")
+        sys.exit(1)
 
     # Mark articles as sent to kindle BEFORE sending
     # This prevents re-selection if sending fails
