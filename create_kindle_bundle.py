@@ -8,8 +8,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
+
+from tqdm import tqdm
 
 import count_images
 import frontmatter_utils
@@ -87,9 +90,19 @@ def get_candidate_articles(filter_sent: bool = True) -> list[tuple[Path, dict]]:
         }
         candidates.append((article, article_metadata))
 
-    # Sort by creation time (oldest first)
-    candidates.sort(key=lambda x: x[1]['ctime'])
+    # Sort by creation date (oldest first) - uses 'created' from metadata
+    candidates.sort(key=lambda x: x[1]['date'])
     return candidates
+
+
+def count_total_images(articles: list[Path]) -> int:
+    """Count total images across selected articles."""
+    total = 0
+    for article in articles:
+        content = article.read_text(encoding="utf-8")
+        metadata, _ = parse_frontmatter(content)
+        total += int(metadata.get('image_count', 0))
+    return total
 
 
 def display_article_selection_ui(candidates: list[tuple[Path, dict]], target_words: int) -> list[Path]:
@@ -299,57 +312,106 @@ def mark_sent_to_kindle(filepath: Path) -> None:
     filepath.write_text(updated, encoding="utf-8")
 
 
-def convert_webp_images(epub_path: Path) -> Path:
-    """Convert WebP images to JPEG in the EPUB for Kindle compatibility.
+def compress_and_convert_images(epub_path: Path) -> Path:
+    """Compress and convert images in the EPUB for Kindle compatibility and size optimization.
     
-    Kindle doesn't support WebP images in EPUBs, so we need to convert them.
+    - Resizes all images to max 800px width
+    - Converts WebP to JPEG (Kindle doesn't support WebP)
+    - Compresses JPEGs with 80% quality
     """
     import zipfile
     import tempfile
     
     temp_epub = epub_path.with_suffix('.tmp.epub')
     
-    # First pass: convert WebP images to JPEG
-    webp_conversions = {}  # old filename -> new filename
+    # First pass: count total images
+    with zipfile.ZipFile(epub_path, 'r') as epub_zip:
+        total_images = sum(1 for item in epub_zip.infolist() 
+                          if item.filename.lower().endswith(('.webp', '.jpg', '.jpeg', '.png')))
+    
+    if total_images == 0:
+        print("No images to compress.")
+        return epub_path
+    
+    # First pass: compress and convert images with progress bar
+    image_conversions = {}  # old filename -> new filename
+    processed_count = 0
     
     with zipfile.ZipFile(epub_path, 'r') as epub_zip:
         with zipfile.ZipFile(temp_epub, 'w', zipfile.ZIP_DEFLATED) as new_zip:
-            for item in epub_zip.infolist():
-                data = epub_zip.read(item.filename)
-                
-                # Check if this is a WebP image
-                if item.filename.lower().endswith('.webp'):
-                    tmp_webp = Path(tempfile.mktemp(suffix='.webp'))
-                    tmp_webp.write_bytes(data)
+            # Create progress bar for image processing
+            with tqdm(total=total_images, desc="Compressing images", unit="img") as pbar:
+                for item in epub_zip.infolist():
+                    data = epub_zip.read(item.filename)
                     
-                    jpg_path = None
-                    try:
-                        # Convert using sips (macOS built-in)
-                        jpg_path = tmp_webp.with_suffix('.jpg')
-                        result = subprocess.run(
-                            ['sips', '-s', 'format', 'jpeg', str(tmp_webp), '--out', str(jpg_path)],
-                            capture_output=True
-                        )
+                    # Check if this is an image file
+                    is_webp = item.filename.lower().endswith('.webp')
+                    is_image = is_webp or item.filename.lower().endswith(('.jpg', '.jpeg', '.png'))
+                    
+                    if is_image:
+                        processed_count += 1
+                        pbar.set_postfix_str(f"Processing {Path(item.filename).name[:30]}")
                         
-                        if result.returncode == 0 and jpg_path.exists():
-                            new_filename = item.filename[:-5] + '.jpg'  # Replace .webp with .jpg
-                            new_zip.writestr(new_filename, jpg_path.read_bytes())
-                            webp_conversions[item.filename] = new_filename
-                            print(f"  Converted: {item.filename} -> {new_filename}")
+                        # Determine output format and extension
+                        if is_webp:
+                            new_ext = '.jpg'
+                            tmp_suffix = '.webp'
                         else:
-                            new_zip.writestr(item, data)
-                            print(f"  Warning: Could not convert {item.filename}")
-                    finally:
-                        if tmp_webp.exists():
-                            tmp_webp.unlink()
-                        if jpg_path and jpg_path.exists():
-                            jpg_path.unlink()
-                else:
-                    new_zip.writestr(item, data)
+                            new_ext = '.jpg'
+                            tmp_suffix = Path(item.filename).suffix
+                        
+                        tmp_img = Path(tempfile.mktemp(suffix=tmp_suffix))
+                        tmp_img.write_bytes(data)
+                        
+                        jpg_path = None
+                        try:
+                            # Compress and convert using sips (macOS built-in)
+                            # - Resample to max 800px width
+                            # - Convert to JPEG with 80% quality
+                            jpg_path = tmp_img.with_suffix('.jpg')
+                            result = subprocess.run(
+                                ['sips', 
+                                 '--resampleWidth', '800',
+                                 '-s', 'format', 'jpeg',
+                                 '-s', 'formatOptions', '80',
+                                 str(tmp_img), 
+                                 '--out', str(jpg_path)],
+                                capture_output=True
+                            )
+                            
+                            if result.returncode == 0 and jpg_path.exists():
+                                new_filename = Path(item.filename).with_suffix(new_ext).name
+                                # Preserve directory structure if any
+                                if '/' in item.filename:
+                                    new_filename = str(Path(item.filename).parent / new_filename)
+                                
+                                # Check if compression actually happened
+                                original_size = len(data)
+                                compressed_size = jpg_path.stat().st_size
+                                compression_ratio = (1 - compressed_size/original_size) * 100
+                                
+                                new_zip.writestr(new_filename, jpg_path.read_bytes())
+                                image_conversions[item.filename] = new_filename
+                                
+                                status = "Converted" if is_webp else "Compressed"
+                                pbar.set_postfix_str(f"{status}: {compression_ratio:.1f}% smaller")
+                            else:
+                                # Compression failed, write original
+                                new_zip.writestr(item, data)
+                                pbar.set_postfix_str(f"Warning: Could not compress {Path(item.filename).name[:20]}")
+                        finally:
+                            if tmp_img.exists():
+                                tmp_img.unlink()
+                            if jpg_path and jpg_path.exists():
+                                jpg_path.unlink()
+                        
+                        pbar.update(1)
+                    else:
+                        new_zip.writestr(item, data)
     
     temp_epub.replace(epub_path)
     
-    # Second pass: update HTML references from .webp to .jpg
+    # Second pass: update HTML references to point to new filenames
     temp_epub2 = epub_path.with_suffix('.tmp2.epub')
     
     with zipfile.ZipFile(epub_path, 'r') as epub_zip:
@@ -357,20 +419,24 @@ def convert_webp_images(epub_path: Path) -> Path:
             for item in epub_zip.infolist():
                 data = epub_zip.read(item.filename)
                 
-                # Update HTML/XHTML files to reference .jpg instead of .webp
+                # Update HTML/XHTML files to reference new filenames
                 if item.filename.endswith(('.html', '.xhtml')):
-                    data = data.replace(b'.webp', b'.jpg')
+                    # Replace old image references with new ones
+                    for old_name, new_name in image_conversions.items():
+                        old_basename = Path(old_name).name
+                        new_basename = Path(new_name).name
+                        data = data.replace(old_basename.encode(), new_basename.encode())
                 
                 new_zip.writestr(item, data)
     
     temp_epub2.replace(epub_path)
     
-    print("Converted WebP images to JPEG for Kindle compatibility.")
+    print(f"\nProcessed {processed_count} images for Kindle compatibility.")
     return epub_path
 
 
 def send_to_kindle(epub_path: Path, title: str) -> bool:
-    """Send the epub to Kindle via calibre-smtp."""
+    """Send the epub to Kindle via calibre-smtp with progress indication."""
     password = os.environ.get("GMAIL_APP_PASSWORD")
     if not password:
         print("Error: GMAIL_APP_PASSWORD environment variable not set.")
@@ -389,7 +455,28 @@ def send_to_kindle(epub_path: Path, title: str) -> bool:
         title,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Show spinner while sending email
+    import threading
+    stop_spinner = threading.Event()
+    
+    def spinner():
+        spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        i = 0
+        while not stop_spinner.is_set():
+            print(f"\r{spinner_chars[i % len(spinner_chars)]} Uploading to Kindle...", end='', flush=True)
+            i += 1
+            time.sleep(0.1)
+    
+    spinner_thread = threading.Thread(target=spinner)
+    spinner_thread.start()
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    finally:
+        stop_spinner.set()
+        spinner_thread.join()
+        print("\r" + " " * 50 + "\r", end='')  # Clear spinner line
+
     if result.returncode != 0:
         print(f"Error sending to Kindle: {result.stderr}")
         return False
@@ -441,6 +528,14 @@ def main():
     # Step 1.5: Normalize frontmatter
     print("Normalizing frontmatter...")
     frontmatter_utils.normalize_inbox_articles()
+
+    print("\nStripping UTM parameters from sources...")
+    utm_stats = frontmatter_utils.strip_utm_from_inbox_sources()
+    print(f"  Cleaned {utm_stats['updated']} of {utm_stats['total']} article sources")
+
+    print("\nCleaning question marks from filenames...")
+    filename_stats = frontmatter_utils.clean_inbox_filenames()
+    print(f"  Renamed {filename_stats['renamed']} files")
 
     # Step 2: Set fixed target word count
     TARGET_WORDS = 20000
@@ -498,6 +593,10 @@ def main():
     else:
         articles = display_article_selection_ui(candidates, TARGET_WORDS)
 
+    # Count total images before creating EPUB
+    total_images = count_total_images(articles)
+    print(f"\nFound {total_images} images across {len(articles)} articles")
+
     # Step 4: Continue with existing epub creation logic
     today = datetime.now().strftime("%Y-%m-%d")
     epub_file = OUTPUT_DIR / f"articles-{today}.epub"
@@ -511,7 +610,7 @@ def main():
 
         # Prepare each article with proper title heading
         prepared_files = []
-        for i, article in enumerate(articles):
+        for i, article in enumerate(tqdm(articles, desc="Preparing articles", unit="article")):
             prepared_content = prepare_article_for_epub(article)
             prepared_file = tmpdir / f"{i:02d}_{article.name}"
             prepared_file.write_text(prepared_content, encoding="utf-8")
@@ -530,27 +629,83 @@ def main():
         ]
 
         print(f"\nCreating epub...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Show two-phase spinner while pandoc runs
+        # Phase 1: Downloading images (~70% of typical time)
+        # Phase 2: Creating EPUB structure (~30% of typical time)
+        import threading
+        stop_spinner = threading.Event()
+        start_time = time.time()
+        
+        def format_elapsed(seconds):
+            """Format elapsed time as MM:SS."""
+            mins, secs = divmod(int(seconds), 60)
+            if mins > 0:
+                return f"{mins}:{secs:02d}"
+            return f"{secs}s"
+        
+        def spinner():
+            spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+            i = 0
+            phase_switched = False
+            
+            while not stop_spinner.is_set():
+                elapsed = time.time() - start_time
+                elapsed_str = format_elapsed(elapsed)
+                char = spinner_chars[i % len(spinner_chars)]
+                
+                # Switch phases after ~3 seconds (typical download time)
+                # This is an estimate - pandoc doesn't give us real progress
+                if not phase_switched and elapsed > 3:
+                    phase_switched = True
+                
+                if not phase_switched:
+                    msg = f"{char} Downloading {total_images} images... [{elapsed_str}]"
+                else:
+                    msg = f"{char} Creating EPUB structure... [{elapsed_str}]"
+                
+                print(f"\r{msg}", end='', flush=True)
+                i += 1
+                time.sleep(0.1)
+        
+        spinner_thread = threading.Thread(target=spinner)
+        spinner_thread.start()
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+        finally:
+            stop_spinner.set()
+            spinner_thread.join()
+            elapsed_total = time.time() - start_time
+            print("\r" + " " * 70 + "\r", end='')  # Clear spinner line
 
         if result.returncode != 0:
             print(f"Error: {result.stderr}")
             return
 
-        print(f"Created: {epub_file}")
-        print(f"Size: {epub_file.stat().st_size / 1024:.1f} KB")
+        # Format elapsed time
+        mins, secs = divmod(int(elapsed_total), 60)
+        if mins > 0:
+            elapsed_fmt = f"{mins}m {secs}s"
+        else:
+            elapsed_fmt = f"{secs}s"
+        
+        print(f"✓ EPUB created in {elapsed_fmt} (processed ~{total_images} images)")
+        print(f"  File: {epub_file}")
+        print(f"  Size: {epub_file.stat().st_size / 1024:.1f} KB")
 
-        # Convert WebP images to JPEG for Kindle compatibility
-        print("\nConverting WebP images to JPEG...")
-        convert_webp_images(epub_file)
-        print(f"Size after conversion: {epub_file.stat().st_size / 1024:.1f} KB")
+        # Compress and convert images for Kindle compatibility and size optimization
+        compress_and_convert_images(epub_file)
+        print(f"Size after compression: {epub_file.stat().st_size / 1024:.1f} KB")
 
-    # Check file size against Gmail's 15MB attachment limit
-    GMAIL_SIZE_LIMIT = 15 * 1024 * 1024  # 15 MB in bytes
+    # Check file size against 25MB attachment limit
+    SIZE_LIMIT_MB = 25
+    SIZE_LIMIT = SIZE_LIMIT_MB * 1024 * 1024  # 25 MB in bytes
     file_size = epub_file.stat().st_size
 
-    if file_size > GMAIL_SIZE_LIMIT:
+    if file_size > SIZE_LIMIT:
         size_mb = file_size / (1024 * 1024)
-        print(f"\nError: EPUB file is {size_mb:.1f}MB, which exceeds Gmail's 15MB attachment limit.")
+        print(f"\nError: EPUB file is {size_mb:.1f}MB, which exceeds the {SIZE_LIMIT_MB}MB attachment limit.")
         print("Please make one of the following changes and re-run:")
         print("  - Remove some articles from the selection")
         print("  - Lower the target word count")
@@ -560,7 +715,7 @@ def main():
     # Mark articles as sent to kindle BEFORE sending
     # This prevents re-selection if sending fails
     print("\nMarking articles as sent-to-kindle...")
-    for article in articles:
+    for article in tqdm(articles, desc="Updating articles", unit="article"):
         mark_sent_to_kindle(article)
     print(f"Updated {len(articles)} article(s).")
 

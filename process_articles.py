@@ -190,6 +190,14 @@ def main():
     print("\nNormalizing frontmatter...")
     frontmatter_utils.normalize_inbox_articles()
 
+    print("\nStripping UTM parameters from sources...")
+    utm_stats = frontmatter_utils.strip_utm_from_inbox_sources()
+    print(f"  Cleaned {utm_stats['updated']} of {utm_stats['total']} article sources")
+
+    print("\nCleaning question marks from filenames...")
+    filename_stats = frontmatter_utils.clean_inbox_filenames()
+    print(f"  Renamed {filename_stats['renamed']} files")
+
     articles = get_kindle_articles()
 
     if not articles:

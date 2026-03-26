@@ -3,6 +3,7 @@
 
 import re
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 INBOX_DIR = Path(__file__).parent / "Inbox"
 ARCHIVE_DIR = Path(__file__).parent / "Archive"
@@ -116,6 +117,94 @@ def _normalize_articles_in_dir(directory: Path) -> dict:
             stats["updated"] += 1
         else:
             stats["unchanged"] += 1
+    
+    return stats
+
+
+def strip_utm_from_source_url(url: str) -> str:
+    """Strip UTM parameters from a URL."""
+    if not url or not url.startswith('http'):
+        return url
+    
+    parsed = urlparse(url)
+    query_params = parse_qs(parsed.query)
+    
+    # Remove UTM parameters
+    utm_params = {k: v for k, v in query_params.items() if not k.startswith('utm_')}
+    
+    if utm_params == query_params:
+        # No UTM params to remove
+        return url
+    
+    # Rebuild URL without UTM params
+    new_query = urlencode(utm_params, doseq=True)
+    cleaned_url = urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        new_query,
+        parsed.fragment
+    ))
+    
+    return cleaned_url
+
+
+def strip_utm_from_inbox_sources() -> dict:
+    """Strip UTM parameters from source URLs in Inbox articles."""
+    stats = {"total": 0, "updated": 0, "unchanged": 0}
+    
+    if not INBOX_DIR.exists():
+        return stats
+    
+    for md_file in INBOX_DIR.glob("*.md"):
+        stats["total"] += 1
+        content = md_file.read_text(encoding="utf-8")
+        frontmatter, body = parse_frontmatter(content)
+        
+        source = frontmatter.get("source", "")
+        if source:
+            cleaned_source = strip_utm_from_source_url(source)
+            if cleaned_source != source:
+                frontmatter["source"] = cleaned_source
+                new_content = serialize_frontmatter(frontmatter, body)
+                md_file.write_text(new_content, encoding="utf-8")
+                stats["updated"] += 1
+            else:
+                stats["unchanged"] += 1
+        else:
+            stats["unchanged"] += 1
+    
+    return stats
+
+
+def clean_inbox_filenames() -> dict:
+    """Remove question marks from filenames in Inbox."""
+    stats = {"total": 0, "renamed": 0}
+    
+    if not INBOX_DIR.exists():
+        return stats
+    
+    for md_file in INBOX_DIR.glob("*.md"):
+        stats["total"] += 1
+        
+        if "?" in md_file.name:
+            # Create new filename without question marks
+            new_name = md_file.name.replace("?", "")
+            new_path = INBOX_DIR / new_name
+            
+            # Handle name collision
+            if new_path.exists():
+                base = new_path.stem
+                ext = new_path.suffix
+                counter = 1
+                while new_path.exists():
+                    new_path = INBOX_DIR / f"{base}_{counter}{ext}"
+                    counter += 1
+            
+            # Rename the file
+            md_file.rename(new_path)
+            stats["renamed"] += 1
     
     return stats
 
