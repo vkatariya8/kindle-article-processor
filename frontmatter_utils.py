@@ -19,7 +19,7 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
         return {}, content
 
     frontmatter_str = content[4:end_match.start() + 3]
-    body = content[end_match.end() + 4:]
+    body = content[end_match.end() + 3:]
 
     frontmatter = {}
     current_key = None
