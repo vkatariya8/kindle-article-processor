@@ -14,11 +14,13 @@ from pathlib import Path
 
 from tqdm import tqdm
 
+import archive_read_articles
 import count_images
 import frontmatter_utils
 
 INBOX_DIR = Path(__file__).parent / "Inbox"
 OUTPUT_DIR = Path(__file__).parent
+MAX_IMAGES = 10  # Articles with more images are excluded from bundling
 
 
 def get_oldest_articles(count: int = 10) -> list[Path]:
@@ -60,15 +62,18 @@ def calculate_word_count(filepath: Path) -> int:
     return len(body.split())
 
 
-def get_candidate_articles(filter_sent: bool = True) -> list[tuple[Path, dict]]:
+def get_candidate_articles(filter_sent: bool = True) -> tuple[list[tuple[Path, dict]], int]:
     """Get candidate articles with metadata, sorted oldest first.
 
-    Returns list of tuples: (filepath, metadata_dict)
+    Returns tuple of:
+        - list of (filepath, metadata_dict) tuples
+        - int count of articles skipped for having too many images
     metadata_dict contains: title, word_count, date, ctime
     """
     articles = list(INBOX_DIR.glob("*.md"))
 
     candidates = []
+    skipped_for_images = 0
     for article in articles:
         content = article.read_text(encoding="utf-8")
         metadata, body = parse_frontmatter(content)
@@ -79,6 +84,11 @@ def get_candidate_articles(filter_sent: bool = True) -> list[tuple[Path, dict]]:
 
         # Get image count for display
         image_count = int(metadata.get('image_count', 0))
+
+        # Skip articles with too many images
+        if image_count > MAX_IMAGES:
+            skipped_for_images += 1
+            continue
 
         article_metadata = {
             'title': metadata.get('title', article.stem),
@@ -92,7 +102,7 @@ def get_candidate_articles(filter_sent: bool = True) -> list[tuple[Path, dict]]:
 
     # Sort by creation date (oldest first) - uses 'created' from metadata
     candidates.sort(key=lambda x: x[1]['date'])
-    return candidates
+    return candidates, skipped_for_images
 
 
 def count_total_images(articles: list[Path]) -> int:
@@ -304,12 +314,29 @@ def mark_sent_to_kindle(filepath: Path) -> None:
     """Update the sent-to-kindle property to yes in the article's frontmatter."""
     content = filepath.read_text(encoding="utf-8")
     updated = re.sub(
-        r'^"?sent-to-kindle"?:?\s*.*$',
+        r'"?sent-to-kindle"?:?\s*.*$',
         r'sent-to-kindle: yes',
         content,
         flags=re.MULTILINE
     )
     filepath.write_text(updated, encoding="utf-8")
+
+
+def get_running_count() -> int:
+    """Read the current running count from running_count.txt."""
+    count_file = OUTPUT_DIR / "running_count.txt"
+    if count_file.exists():
+        try:
+            return int(count_file.read_text(encoding="utf-8").strip())
+        except (ValueError, IOError):
+            pass
+    return 0
+
+
+def save_running_count(count: int) -> None:
+    """Save the running count to running_count.txt."""
+    count_file = OUTPUT_DIR / "running_count.txt"
+    count_file.write_text(str(count), encoding="utf-8")
 
 
 def compress_and_convert_images(epub_path: Path) -> Path:
@@ -366,14 +393,17 @@ def compress_and_convert_images(epub_path: Path) -> Path:
                         jpg_path = None
                         try:
                             # Compress and convert using sips (macOS built-in)
-                            # - Resample to max 800px width
-                            # - Convert to JPEG with 80% quality
+                            # - Resample to max 600px width (800px height max)
+                            # - Convert to grayscale JPEG with 60% quality
+                            # - Aggressive compression for 25MB limit compliance
                             jpg_path = tmp_img.with_suffix('.jpg')
                             result = subprocess.run(
                                 ['sips', 
-                                 '--resampleWidth', '800',
+                                 '--resampleWidth', '600',
+                                 '--resampleHeight', '800',
                                  '-s', 'format', 'jpeg',
-                                 '-s', 'formatOptions', '80',
+                                 '-s', 'formatOptions', '60',
+                                 '--setProperty', 'colorspace', 'Gray',
                                  str(tmp_img), 
                                  '--out', str(jpg_path)],
                                 capture_output=True
@@ -483,7 +513,7 @@ def send_to_kindle(epub_path: Path, title: str) -> bool:
     return True
 
 
-def create_metadata(articles: list[Path]) -> str:
+def create_metadata(articles: list[Path], issue_number: int) -> str:
     """Create YAML metadata for the epub."""
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -499,7 +529,7 @@ def create_metadata(articles: list[Path]) -> str:
         date_range = "various dates"
 
     return f"""---
-title: "Articles Bundle - {today}"
+title: "Digest: Issue {issue_number}"
 subtitle: "Collection of {len(articles)} articles from {date_range}"
 author: "Various Authors"
 date: "{today}"
@@ -537,16 +567,27 @@ def main():
     filename_stats = frontmatter_utils.clean_inbox_filenames()
     print(f"  Renamed {filename_stats['renamed']} files")
 
+    # Step 1.75: Archive articles marked as read
+    print("\nArchiving read articles...")
+    archive_stats = archive_read_articles.archive_read_articles()
+    if archive_stats['archived'] > 0 or archive_stats['dnf'] > 0:
+        print(f"  Archived {archive_stats['archived']} article(s) marked as read and {archive_stats['dnf']} article(s) marked as DNF")
+    print(f"  Kept {archive_stats['skipped']} unread article(s) in Inbox")
+
     # Step 2: Set fixed target word count
     TARGET_WORDS = 20000
     print(f"Target word count: {TARGET_WORDS:,} words\n")
 
     # Step 3: Get candidate articles (unsent only, filtered by image count)
-    candidates = get_candidate_articles(filter_sent=True)
+    candidates, skipped_for_images = get_candidate_articles(filter_sent=True)
+
+    if skipped_for_images > 0:
+        print(f"By the way, I'm excluding {skipped_for_images} article(s) because they have too many images (>{MAX_IMAGES}).")
+        print()
 
     if not candidates:
         print("No unsent articles found in Inbox.")
-        print("All articles have already been sent to Kindle.")
+        print("All articles have already been sent to Kindle or have too many images.")
         return
 
     print(f"Found {len(candidates)} unsent article(s) available for selection.\n")
@@ -597,16 +638,21 @@ def main():
     total_images = count_total_images(articles)
     print(f"\nFound {total_images} images across {len(articles)} articles")
 
+    # Get next issue number from running count
+    current_count = get_running_count()
+    issue_number = current_count + 1
+    print(f"Generating Digest: Issue {issue_number}")
+
     # Step 4: Continue with existing epub creation logic
     today = datetime.now().strftime("%Y-%m-%d")
-    epub_file = OUTPUT_DIR / f"articles-{today}.epub"
+    epub_file = OUTPUT_DIR / f"Digest-Issue-{issue_number}.epub"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
 
         # Write metadata file
         metadata_file = tmpdir / "metadata.yaml"
-        metadata_file.write_text(create_metadata(articles), encoding="utf-8")
+        metadata_file.write_text(create_metadata(articles, issue_number), encoding="utf-8")
 
         # Prepare each article with proper title heading
         prepared_files = []
@@ -712,18 +758,18 @@ def main():
         print("  - Select articles with fewer images")
         sys.exit(1)
 
-    # Mark articles as sent to kindle BEFORE sending
-    # This prevents re-selection if sending fails
-    print("\nMarking articles as sent-to-kindle...")
-    for article in tqdm(articles, desc="Updating articles", unit="article"):
-        mark_sent_to_kindle(article)
-    print(f"Updated {len(articles)} article(s).")
-
     # Send to Kindle
     print("\nSending to Kindle...")
-    book_title = f"Articles Bundle - {today}"
+    book_title = f"Digest: Issue {issue_number}"
     if send_to_kindle(epub_file, book_title):
         print("Sent successfully!")
+        save_running_count(issue_number)
+
+        # Mark articles as sent to kindle AFTER successful sending
+        print("\nMarking articles as sent-to-kindle...")
+        for article in tqdm(articles, desc="Updating articles", unit="article"):
+            mark_sent_to_kindle(article)
+        print(f"Updated {len(articles)} article(s).")
     else:
         print("Failed to send to Kindle.")
         sys.exit(1)

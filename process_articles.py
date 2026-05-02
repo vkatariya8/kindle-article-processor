@@ -7,11 +7,13 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+import archive_read_articles
 import count_images
 import frontmatter_utils
 
 INBOX_DIR = Path(__file__).parent / "Inbox"
 ARCHIVE_DIR = Path(__file__).parent / "Archive"
+DNF_DIR = Path(__file__).parent / "DNF"
 
 
 def parse_frontmatter(content: str) -> tuple[dict, str]:
@@ -24,7 +26,7 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
         return {}, content
 
     frontmatter_str = content[4:end_match.start() + 3]
-    body = content[end_match.end() + 4:]
+    body = content[end_match.end() + 3:]
 
     # Simple YAML parsing for our specific format
     frontmatter = {}
@@ -128,14 +130,20 @@ def process_article(filepath: Path) -> None:
         print("Skipping...")
         return
 
-    # Step 2: Like?
-    like = input("[2/4] Like this article? (y/n, Enter for no): ").strip().lower()
+    # Step 2: Did you finish?
+    finish = input("[2/4] Did you finish this article? (yes/dnf/Enter to leave in Inbox): ").strip().lower()
+    if finish not in ("yes", "dnf"):
+        print("Left in Inbox.")
+        return
+
+    # Step 3: Like?
+    like = input("[3/4] Like this article? (y/n, Enter for no): ").strip().lower()
     if like == "y":
         frontmatter["liked"] = "yes"
         print("Marked as liked.")
 
-    # Step 3: Notes?
-    notes_input = input("[3/4] Quick notes (or Enter to skip): ").strip()
+    # Step 4: Notes?
+    notes_input = input("[4/4] Quick notes (or Enter to skip): ").strip()
     if notes_input:
         existing_notes = frontmatter.get("notes", "")
         if existing_notes:
@@ -144,39 +152,38 @@ def process_article(filepath: Path) -> None:
             frontmatter["notes"] = notes_input
         print("Notes saved.")
 
-    # Step 4: Archive?
-    archive = input("[4/4] Archive this article? (y/n, Enter for no): ").strip().lower()
-    if archive == "y":
-        # Remove any existing read-status variants to avoid duplication
-        keys_to_remove = [k for k in frontmatter.keys() if k in ("read-status", "read_status", '"read-status"')]
-        for key in keys_to_remove:
-            del frontmatter[key]
-        
-        frontmatter["read-status"] = "read"
-        frontmatter["date-read"] = datetime.now().strftime("%Y-%m-%d")
+    # Remove any existing read-status variants to avoid duplication
+    keys_to_remove = [k for k in frontmatter.keys() if k in ("read-status", "read_status", '"read-status"')]
+    for key in keys_to_remove:
+        del frontmatter[key]
 
-        # Write updated content
-        new_content = serialize_frontmatter(frontmatter, body)
+    frontmatter["read-status"] = finish
+    frontmatter["date-read"] = datetime.now().strftime("%Y-%m-%d")
 
-        # Move to archive
-        dest = ARCHIVE_DIR / filepath.name
-        if dest.exists():
-            # Handle name collision
-            base = filepath.stem
-            ext = filepath.suffix
-            counter = 1
-            while dest.exists():
-                dest = ARCHIVE_DIR / f"{base}_{counter}{ext}"
-                counter += 1
+    # Write updated content
+    new_content = serialize_frontmatter(frontmatter, body)
 
-        dest.write_text(new_content, encoding="utf-8")
-        filepath.unlink()
-        print(f"Archived to: {dest.name}")
+    # Move to destination based on finish status
+    if finish == "yes":
+        dest_dir = ARCHIVE_DIR
+        action_label = "Archived"
     else:
-        # Still save any changes (like, notes)
-        new_content = serialize_frontmatter(frontmatter, body)
-        filepath.write_text(new_content, encoding="utf-8")
-        print("Changes saved (not archived).")
+        dest_dir = DNF_DIR
+        action_label = "Moved to DNF"
+
+    dest = dest_dir / filepath.name
+    if dest.exists():
+        # Handle name collision
+        base = filepath.stem
+        ext = filepath.suffix
+        counter = 1
+        while dest.exists():
+            dest = dest_dir / f"{base}_{counter}{ext}"
+            counter += 1
+
+    dest.write_text(new_content, encoding="utf-8")
+    filepath.unlink()
+    print(f"{action_label}: {dest.name}")
 
 
 def main():
@@ -197,6 +204,12 @@ def main():
     print("\nCleaning question marks from filenames...")
     filename_stats = frontmatter_utils.clean_inbox_filenames()
     print(f"  Renamed {filename_stats['renamed']} files")
+
+    print("\nArchiving read articles...")
+    archive_stats = archive_read_articles.archive_read_articles()
+    if archive_stats['archived'] > 0 or archive_stats['dnf'] > 0:
+        print(f"  Archived {archive_stats['archived']} article(s) marked as read and {archive_stats['dnf']} article(s) marked as DNF")
+    print(f"  Kept {archive_stats['skipped']} unread article(s) in Inbox")
 
     articles = get_kindle_articles()
 
