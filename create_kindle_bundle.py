@@ -339,92 +339,137 @@ def save_running_count(count: int) -> None:
     count_file.write_text(str(count), encoding="utf-8")
 
 
+def get_cover_image(issue_number: int) -> Path | None:
+    """Download a cover image from Lorem Picsum, seeded by issue number.
+
+    Uses 960×600 (landscape-ish) which crops well to Kindle's thumbnail
+    aspect ratio. The image is cached in .covers/ so repeated runs for
+    the same issue number don't re-download.
+
+    Returns Path to the cover image, or None on any failure (network
+    error, HTTP error, etc.) so covers are always optional.
+    """
+    import urllib.request
+    import urllib.error
+
+    COVER_DIR = OUTPUT_DIR / ".covers"
+    COVER_DIR.mkdir(parents=True, exist_ok=True)
+    cover_path = COVER_DIR / f"issue-{issue_number}.jpg"
+
+    # Already cached — return immediately
+    if cover_path.exists() and cover_path.stat().st_size > 0:
+        return cover_path
+
+    # Download from Lorem Picsum using issue number as seed for determinism
+    url = f"https://picsum.photos/seed/kk{issue_number}/960/600"
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "kk-cli/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                print(f"  Cover image: HTTP {resp.status}, skipping.")
+                return None
+            cover_path.write_bytes(resp.read())
+        print(f"  Cover image: downloaded (issue {issue_number})")
+        return cover_path
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        print(f"  Cover image: unavailable ({e}), continuing without cover.")
+        return None
+
+
 def compress_and_convert_images(epub_path: Path) -> Path:
     """Compress and convert images in the EPUB for Kindle compatibility and size optimization.
-    
-    - Resizes all images to max 800px width
-    - Converts WebP to JPEG (Kindle doesn't support WebP)
-    - Compresses JPEGs with 80% quality
+
+    - Resizes all images to max 800px width / 600px height
+    - Converts WebP/PNG to JPEG (Kindle doesn't support WebP; PNG transparency
+      renders as black on eInk)
+    - Compresses JPEGs for size
+    - Updates the OPF manifest so Kindle can find the converted images
     """
     import zipfile
     import tempfile
-    
+    import xml.etree.ElementTree as ET
+
     temp_epub = epub_path.with_suffix('.tmp.epub')
-    
+
     # First pass: count total images
     with zipfile.ZipFile(epub_path, 'r') as epub_zip:
-        total_images = sum(1 for item in epub_zip.infolist() 
-                          if item.filename.lower().endswith(('.webp', '.jpg', '.jpeg', '.png')))
-    
+        total_images = sum(1 for item in epub_zip.infolist()
+                          if item.filename.lower().endswith(('.webp', '.jpg', '.jpeg', '.png', '.svg')))
+
     if total_images == 0:
         print("No images to compress.")
         return epub_path
-    
+
     # First pass: compress and convert images with progress bar
     image_conversions = {}  # old filename -> new filename
     processed_count = 0
-    
+
     with zipfile.ZipFile(epub_path, 'r') as epub_zip:
         with zipfile.ZipFile(temp_epub, 'w', zipfile.ZIP_DEFLATED) as new_zip:
             # Create progress bar for image processing
             with tqdm(total=total_images, desc="Compressing images", unit="img") as pbar:
                 for item in epub_zip.infolist():
                     data = epub_zip.read(item.filename)
-                    
+
                     # Check if this is an image file
                     is_webp = item.filename.lower().endswith('.webp')
-                    is_image = is_webp or item.filename.lower().endswith(('.jpg', '.jpeg', '.png'))
-                    
+                    is_svg = item.filename.lower().endswith('.svg')
+                    is_image = is_webp or is_svg or item.filename.lower().endswith(('.jpg', '.jpeg', '.png'))
+
                     if is_image:
                         processed_count += 1
                         pbar.set_postfix_str(f"Processing {Path(item.filename).name[:30]}")
-                        
-                        # Determine output format and extension
-                        if is_webp:
-                            new_ext = '.jpg'
+
+                        # SVGs need special handling — convert to JPEG via sips
+                        if is_svg:
+                            tmp_suffix = '.svg'
+                        elif is_webp:
                             tmp_suffix = '.webp'
                         else:
-                            new_ext = '.jpg'
                             tmp_suffix = Path(item.filename).suffix
-                        
+
                         tmp_img = Path(tempfile.mktemp(suffix=tmp_suffix))
                         tmp_img.write_bytes(data)
-                        
+
                         jpg_path = None
                         try:
                             # Compress and convert using sips (macOS built-in)
-                            # - Resample to max 600px width (800px height max)
-                            # - Convert to grayscale JPEG with 60% quality
-                            # - Aggressive compression for 25MB limit compliance
+                            # - Resample to max 800px width, 600px height
+                            # - Convert to JPEG (handles WebP, PNG, SVG, etc.)
+                            # - 50% quality — good balance for eInk
                             jpg_path = tmp_img.with_suffix('.jpg')
                             result = subprocess.run(
-                                ['sips', 
-                                 '--resampleWidth', '600',
-                                 '--resampleHeight', '800',
+                                ['sips',
+                                 '--resampleWidth', '800',
+                                 '--resampleHeight', '600',
                                  '-s', 'format', 'jpeg',
-                                 '-s', 'formatOptions', '60',
-                                 '--setProperty', 'colorspace', 'Gray',
-                                 str(tmp_img), 
+                                 '-s', 'formatOptions', '50',
+                                 str(tmp_img),
                                  '--out', str(jpg_path)],
                                 capture_output=True
                             )
-                            
+
                             if result.returncode == 0 and jpg_path.exists():
-                                new_filename = Path(item.filename).with_suffix(new_ext).name
+                                new_filename = Path(item.filename).with_suffix('.jpg').name
                                 # Preserve directory structure if any
                                 if '/' in item.filename:
                                     new_filename = str(Path(item.filename).parent / new_filename)
-                                
-                                # Check if compression actually happened
+
                                 original_size = len(data)
                                 compressed_size = jpg_path.stat().st_size
-                                compression_ratio = (1 - compressed_size/original_size) * 100
-                                
+
+                                # Always use the JPEG version for Kindle compatibility
+                                # (even if larger — format compatibility matters more than size)
+                                if compressed_size < original_size:
+                                    compression_ratio = (1 - compressed_size/original_size) * 100
+                                    status = "Converted" if (is_webp or is_svg) else "Compressed"
+                                    pbar.set_postfix_str(f"{status}: {compression_ratio:.1f}% smaller")
+                                else:
+                                    pbar.set_postfix_str("Converted to JPEG for compatibility")
+
                                 new_zip.writestr(new_filename, jpg_path.read_bytes())
                                 image_conversions[item.filename] = new_filename
-                                
-                                status = "Converted" if is_webp else "Compressed"
-                                pbar.set_postfix_str(f"{status}: {compression_ratio:.1f}% smaller")
                             else:
                                 # Compression failed, write original
                                 new_zip.writestr(item, data)
@@ -434,35 +479,83 @@ def compress_and_convert_images(epub_path: Path) -> Path:
                                 tmp_img.unlink()
                             if jpg_path and jpg_path.exists():
                                 jpg_path.unlink()
-                        
+
                         pbar.update(1)
                     else:
                         new_zip.writestr(item, data)
-    
+
     temp_epub.replace(epub_path)
-    
-    # Second pass: update HTML references to point to new filenames
+
+    # Second pass: update HTML references AND the OPF manifest
     temp_epub2 = epub_path.with_suffix('.tmp2.epub')
-    
+
     with zipfile.ZipFile(epub_path, 'r') as epub_zip:
         with zipfile.ZipFile(temp_epub2, 'w', zipfile.ZIP_DEFLATED) as new_zip:
             for item in epub_zip.infolist():
                 data = epub_zip.read(item.filename)
-                
+
                 # Update HTML/XHTML files to reference new filenames
                 if item.filename.endswith(('.html', '.xhtml')):
-                    # Replace old image references with new ones
                     for old_name, new_name in image_conversions.items():
                         old_basename = Path(old_name).name
                         new_basename = Path(new_name).name
                         data = data.replace(old_basename.encode(), new_basename.encode())
-                
+
+                # Update OPF manifest (critical: Kindle won't find images otherwise)
+                if item.filename.endswith('.opf'):
+                    data = _update_opf_manifest(data, image_conversions)
+
                 new_zip.writestr(item, data)
-    
+
     temp_epub2.replace(epub_path)
-    
+
     print(f"\nProcessed {processed_count} images for Kindle compatibility.")
     return epub_path
+
+
+def _update_opf_manifest(opf_bytes: bytes, image_conversions: dict[str, str]) -> bytes:
+    """Update the EPUB OPF manifest to reflect renamed/converted images.
+
+    For each converted image, updates the <item> element's href and media-type
+    so Kindle's reader can locate the image file.
+    """
+    import xml.etree.ElementTree as ET
+
+    opf_str = opf_bytes.decode('utf-8')
+
+    for old_name, new_name in image_conversions.items():
+        old_basename = Path(old_name).name
+        new_basename = Path(new_name).name
+        old_ext = Path(old_name).suffix.lower()
+        new_ext = Path(new_name).suffix.lower()
+
+        # Build media-type mapping
+        media_types = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.webp': 'image/webp',
+            '.svg': 'image/svg+xml',
+        }
+        old_media = media_types.get(old_ext, 'image/jpeg')
+        new_media = media_types.get(new_ext, 'image/jpeg')
+
+        # Update href attribute: old_basename → new_basename
+        # Use a regex that targets href="...old_basename" in <item> elements
+        opf_str = re.sub(
+            r'(<item\b[^>]*?\bhref=")([^"]*' + re.escape(old_basename) + r')(")',
+            lambda m: m.group(1) + m.group(2).replace(old_basename, new_basename) + m.group(3),
+            opf_str
+        )
+
+        # Update media-type for the same item
+        opf_str = re.sub(
+            r'(<item\b[^>]*?\bhref="[^"]*' + re.escape(new_basename) + r'"[^>]*?\bmedia-type=")' + re.escape(old_media) + r'(")',
+            r'\1' + new_media + r'\2',
+            opf_str
+        )
+
+    return opf_str.encode('utf-8')
 
 
 def send_to_kindle(epub_path: Path, title: str) -> bool:
@@ -662,17 +755,29 @@ def main():
             prepared_file.write_text(prepared_content, encoding="utf-8")
             prepared_files.append(prepared_file)
 
-        # Build pandoc command
+        # Download cover image (seeded by issue number, cached in .covers/)
+        cover_path = get_cover_image(issue_number)
+
+        # Build pandoc command with Kindle-optimized CSS
+        css_file = OUTPUT_DIR / "kindle.css"
         cmd = [
             "pandoc",
             str(metadata_file),
             *[str(f) for f in prepared_files],
             "-o", str(epub_file),
+            "--to", "epub3",
+            "--css", str(css_file),
+            "--metadata", "lang=en-US",
             "--toc",
             "--toc-depth=1",
             "--epub-chapter-level=1",
             "--file-scope",
         ]
+
+        # Attach cover image if we have one
+        if cover_path:
+            cmd.insert(1, str(cover_path))
+            cmd.insert(1, "--epub-cover-image")
 
         print(f"\nCreating epub...")
         
