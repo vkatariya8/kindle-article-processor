@@ -1,0 +1,9 @@
+__pycache__
+Archive/
+DNF/
+Inbox/
+.covers/
+*.epub
+.DS_Store
+kats_kable/375.html
+kats_kable/375.md
