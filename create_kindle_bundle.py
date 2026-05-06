@@ -342,8 +342,8 @@ def save_running_count(count: int) -> None:
 def get_cover_image(issue_number: int) -> Path | None:
     """Download a cover image from Lorem Picsum, seeded by issue number.
 
-    Uses 960×600 (landscape-ish) which crops well to Kindle's thumbnail
-    aspect ratio. The image is cached in .covers/ so repeated runs for
+    Uses 600×960 (portrait) which matches Kindle's expected book-cover
+    aspect ratio (~1:1.6). The image is cached in .covers/ so repeated runs for
     the same issue number don't re-download.
 
     Returns Path to the cover image, or None on any failure (network
@@ -361,7 +361,7 @@ def get_cover_image(issue_number: int) -> Path | None:
         return cover_path
 
     # Download from Lorem Picsum using issue number as seed for determinism
-    url = f"https://picsum.photos/seed/kk{issue_number}/960/600"
+    url = f"https://picsum.photos/seed/kk{issue_number}/600/960"
 
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "kk-cli/1.0"})
